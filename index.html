@@ -165,6 +165,13 @@ nav.tabs .live{display:inline-block;width:7px;height:7px;border-radius:50%;backg
   .ex.open .ex-body{animation:drop .18s ease-out}
   @keyframes drop{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
 }
+.data{background:var(--surface);border-radius:14px;padding:14px 16px;margin-top:10px}
+.data p{margin:0 0 6px;font-size:15px}
+.data .btn{margin-top:8px;display:block;text-align:center}
+.data details{margin-top:14px;font-size:15px}
+.data summary{color:var(--muted);cursor:pointer;padding:4px 0}
+.data textarea{width:100%;min-height:110px;margin-top:8px;border-radius:10px;border:1.5px solid var(--line);background:var(--bg);padding:10px;font:13px/1.4 ui-monospace,Menlo,monospace;color:var(--ink)}
+.vh{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden;pointer-events:none}
 </style>
 </head>
 <body>
@@ -209,10 +216,11 @@ function defaultPlan(){
 
 /* ---------- storage: claude db (private per user) → localStorage → memory ---------- */
 const store = {
-  mode:"mem", db:null, uid:null, chains:{}, pending:0,
+  mode:"mem", db:null, uid:null, downloads:null, chains:{}, pending:0,
   async init(){
     try{
       if (window.claude && typeof window.claude.use === "function"){
+        window.claude.use("downloads").then(x => { this.downloads = x; }, () => {});
         const [db, user] = await Promise.all([window.claude.use("db"), window.claude.use("user")]);
         if (db && user){
           const uid = await user.id();
@@ -227,15 +235,19 @@ const store = {
   async retry(fn){ try{ return await fn(); }catch(e){ if (e && e.code === "unavailable"){ await new Promise(r=>setTimeout(r, 400 + Math.random()*600)); return await fn(); } throw e; } },
   async loadAll(){
     if (this.mode === "db"){
-      try{
-        const keys = ["plan","active","weight","meta"];
-        const snaps = await Promise.all(keys.map(k => this.retry(() => this.db.doc(this.base()+"/"+k).get())));
-        const out = {};
-        keys.forEach((k,i) => out[k] = snaps[i].exists ? JSON.parse(JSON.stringify(snaps[i].data())) : null);
-        const qs = await this.retry(() => this.sessionsCol().orderBy("startedAt","desc").limit(1000).get());
-        out.sessions = qs.docs.map(d => JSON.parse(JSON.stringify(d.data())));
-        return out;
-      }catch(e){ this.mode = "local"; }
+      // time-limited; on failure the caller shows a retry screen (no silent switch to local storage)
+      return await Promise.race([
+        (async () => {
+          const keys = ["plan","active","weight","meta"];
+          const snaps = await Promise.all(keys.map(k => this.retry(() => this.db.doc(this.base()+"/"+k).get())));
+          const out = {};
+          keys.forEach((k,i) => out[k] = snaps[i].exists ? JSON.parse(JSON.stringify(snaps[i].data())) : null);
+          const qs = await this.retry(() => this.sessionsCol().orderBy("startedAt","desc").limit(1000).get());
+          out.sessions = qs.docs.map(d => JSON.parse(JSON.stringify(d.data())));
+          return out;
+        })(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 10000))
+      ]);
     }
     const out = {};
     for (const k of ["plan","active","weight","meta","sessions"]){
@@ -285,7 +297,7 @@ window.addEventListener("pagehide", flushAll);
 
 /* ---------- state ---------- */
 const S = {plan:null, active:null, sessions:[], weight:{entries:[]}, meta:{rotPos:-1}};
-const UI = {tab:"training", planDay:"zug", progEx:null, progMetric:"1rm", openSession:null, modal:null, toast:null};
+const UI = {tab:"training", planDay:"zug", progEx:null, progMetric:"1rm", openSession:null, modal:null, toast:null, backupText:null};
 
 /* ---------- domain logic ---------- */
 function nextInRotation(){
@@ -349,6 +361,66 @@ function finishTraining(){
 function discardTraining(){
   S.active = null; clearTimeout(timers.active); delete timers.active; store.put("active", null);
   toast("Training verworfen"); render();
+}
+
+/* ---------- backup ---------- */
+function backupData(){
+  flushAll();
+  return {app:"satzbuch", version:1, exportedAt:new Date().toISOString(), plan:S.plan, weight:S.weight, meta:S.meta, sessions:S.sessions};
+}
+const backupName = () => `satzbuch-backup-${todayISO()}.json`;
+async function exportBackup(){
+  const json = JSON.stringify(backupData());
+  const name = backupName();
+  if (store.downloads){
+    try{ await store.downloads.save({filename:name, data:json}); toast("Backup gespeichert"); render(); return; }
+    catch(e){ if (e && e.code === "declined") return; }
+  }
+  try{
+    const file = new File([json], name, {type:"application/json"});
+    if (navigator.canShare && navigator.canShare({files:[file]})){
+      await navigator.share({files:[file]}); return;
+    }
+  }catch(e){ if (e && e.name === "AbortError") return; }
+  try{
+    const url = URL.createObjectURL(new Blob([json], {type:"application/json"}));
+    const a = document.createElement("a"); a.href = url; a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    toast("Backup wird gespeichert"); render();
+  }catch(e){ toast("Ging nicht. Nimm „Als Text kopieren“."); render(); }
+}
+async function copyBackup(){
+  const json = JSON.stringify(backupData());
+  try{ await navigator.clipboard.writeText(json); toast("Backup kopiert"); }
+  catch(e){ UI.backupText = json; toast("Text steht unten, bitte selbst kopieren"); }
+  render();
+}
+function parseBackup(text){
+  let o; try{ o = JSON.parse(String(text || "").trim()); }catch(e){ return null; }
+  return o && o.app === "satzbuch" && Array.isArray(o.sessions) ? o : null;
+}
+function askImport(o){
+  if (!o){ toast("Das ist kein Satzbuch-Backup"); render(); return; }
+  const known = new Set(S.sessions.map(s => s.id));
+  const fresh = o.sessions.filter(s => s && s.id && DAYNAME[s.day] && Array.isArray(s.exercises) && isFinite(s.startedAt) && !known.has(s.id));
+  const have = new Set(S.weight.entries.map(e => e.date));
+  const w = o.weight && Array.isArray(o.weight.entries) ? o.weight.entries : [];
+  const freshW = w.filter(e => e && /^\d{4}-\d{2}-\d{2}$/.test(e.date) && isFinite(e.kg) && !have.has(e.date)).map(e => ({date:e.date, kg:+e.kg}));
+  const when = o.exportedAt ? ` vom ${new Date(o.exportedAt).toLocaleDateString("de-DE")}` : "";
+  ask(`Backup${when} einspielen? Dazu kommen ${fresh.length} ${fresh.length === 1 ? "Training" : "Trainings"} und ${freshW.length} ${freshW.length === 1 ? "Gewichtseintrag" : "Gewichtseinträge"}. Plan und Rhythmus kommen aus dem Backup. Was schon da ist, bleibt.`,
+    "Einspielen", () => doImport(o, fresh, freshW));
+}
+function doImport(o, fresh, freshW){
+  S.sessions = S.sessions.concat(fresh).sort((a,b) => b.startedAt - a.startedAt);
+  if (store.mode === "db"){
+    for (const s of fresh){ const c = JSON.parse(JSON.stringify(s)); store.queue("import", () => store.retry(() => store.sessionsCol().doc(s.id).set(c))); }
+  } else store.put("sessions", S.sessions);
+  if (freshW.length){ S.weight.entries = S.weight.entries.concat(freshW); persist("weight", 0); }
+  if (o.plan && o.plan.days){ S.plan = JSON.parse(JSON.stringify(o.plan)); for (const k of DAYS) if (!S.plan.days[k] || !Array.isArray(S.plan.days[k].exercises)) S.plan.days[k] = defaultPlan().days[k]; persist("plan", 0); }
+  if (o.meta && typeof o.meta.rotPos === "number"){ S.meta = {...S.meta, rotPos:o.meta.rotPos}; persist("meta", 0); }
+  UI.backupText = null;
+  toast(`${fresh.length} ${fresh.length === 1 ? "Training" : "Trainings"} übernommen`);
 }
 
 /* ---------- chart ---------- */
@@ -555,7 +627,20 @@ function viewPlan(){
     ${rows || `<p class="empty">Keine Übungen an diesem Tag.</p>`}
     <button class="btn ghost full" style="margin-top:10px" data-act="planadd">Übung hinzufügen</button>
     <p class="muted small" style="margin-top:18px">Änderungen gelten ab dem nächsten gestarteten Training. Der Verlauf bleibt erhalten, auch wenn du eine Übung umbenennst.</p>
-    <button class="btn danger" data-act="askreset">Plan auf Vorschlag zurücksetzen</button>`;
+    <button class="btn danger" data-act="askreset">Plan auf Vorschlag zurücksetzen</button>
+    <h2>Daten sichern</h2>
+    <div class="data">
+      <p>${S.sessions.length} ${S.sessions.length === 1 ? "Training" : "Trainings"}, ${S.weight.entries.length} ${S.weight.entries.length === 1 ? "Gewichtseintrag" : "Gewichtseinträge"}.</p>
+      <p class="muted small">${store.mode === "db" ? "Gespeichert in deinem Claude-Konto." : store.mode === "local" ? "Gespeichert nur hier im Browser auf diesem Handy." : "Wird gerade nicht gespeichert."}</p>
+      <button class="btn primary full" data-act="exportbackup">Backup speichern</button>
+      <button class="btn ghost full" data-act="copybackup">Als Text kopieren</button>
+      <label class="btn ghost full" for="backupfile">Backup einspielen</label>
+      <input type="file" id="backupfile" class="vh" tabindex="-1">
+      <details ${UI.backupText ? "open" : ""}><summary>Backup als Text einfügen</summary>
+        <textarea id="backuptext" placeholder="Backup-Text hier einfügen">${esc(UI.backupText || "")}</textarea>
+        <button class="btn full" data-act="importtext">Text einspielen</button>
+      </details>
+    </div>`;
 }
 
 /* ---------- render ---------- */
@@ -630,6 +715,9 @@ const A = {
   planadd: () => { S.plan.days[UI.planDay].exercises.push({id:UI.planDay+"-"+newId(), name:"Neue Übung", sets:3, reps:10, note:""}); persist("plan"); render();
     setTimeout(() => { const all = document.querySelectorAll('.pl-row input[data-k="name"]'); const el = all[all.length-1]; if (el){ el.focus(); el.select(); } }, 30); },
   askreset: () => ask("Plan auf den Vorschlag zurücksetzen? Deine Änderungen am Plan gehen verloren, dein Verlauf nicht.", "Zurücksetzen", () => { S.plan = defaultPlan(); persist("plan", 0); render(); }, true),
+  exportbackup: () => exportBackup(),
+  copybackup: () => copyBackup(),
+  importtext: () => askImport(parseBackup($("#backuptext").value)),
   closemodal: (t, e) => { if (e.target.closest("[data-stop]") && t.classList.contains("modal")) return; UI.modal = null; render(); },
   confirm: () => { const fn = UI.modal.fn; UI.modal = null; fn(); if (!UI.modal) render(); }
 };
@@ -655,6 +743,14 @@ document.addEventListener("input", e => {
 });
 document.addEventListener("change", e => {
   if (e.target.dataset.f === "progex"){ UI.progEx = e.target.value; render(); }
+  if (e.target.id === "backupfile"){
+    const f = e.target.files && e.target.files[0]; e.target.value = "";
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = () => askImport(parseBackup(r.result));
+    r.onerror = () => { toast("Datei ließ sich nicht lesen"); render(); };
+    r.readAsText(f);
+  }
 });
 document.addEventListener("keydown", e => { if (e.key === "Escape" && UI.modal){ UI.modal = null; render(); } });
 setInterval(() => {
@@ -666,7 +762,15 @@ setInterval(() => {
 /* ---------- boot ---------- */
 (async function boot(){
   await store.init();
-  const d = await store.loadAll();
+  let d;
+  try{ d = await store.loadAll(); }
+  catch(e){
+    $("#app").innerHTML = `<header class="top"><h1 class="brand">Satzbuch</h1></header>
+      <p class="empty">Deine Daten ließen sich gerade nicht laden. Prüf dein Internet und versuch es nochmal.</p>
+      <button class="btn primary full" id="retry">Nochmal versuchen</button>`;
+    $("#retry").onclick = () => { $("#app").innerHTML = '<p class="empty">Lädt …</p>'; boot(); };
+    return;
+  }
   S.plan = d.plan && d.plan.days ? d.plan : defaultPlan();
   for (const k of DAYS) if (!S.plan.days[k]) S.plan.days[k] = defaultPlan().days[k];
   S.active = d.active && d.active.exercises ? d.active : null;
